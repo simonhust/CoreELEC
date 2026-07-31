@@ -1,0 +1,183 @@
+diff --git a/src/libbluray/bluray.c b/src/libbluray/bluray.c
+index 2c49ef3..a7ffcd9 100644
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -43,6 +43,7 @@
+ #include "bdnav/meta_data.h"
+ #include "bdnav/sound_parse.h"
+ #include "bdnav/uo_mask.h"
++#include "decoders/m2ts_demux.h"
+ #include "hdmv/hdmv_vm.h"
+ #include "hdmv/mobj_parse.h"
+ #include "decoders/graphics_controller.h"
+@@ -60,6 +61,58 @@
+ #include <inttypes.h>
+ #include <string.h>
+ 
++/*
++ * DV DT-DL dual-stream state
++ */
++
++#define DV_PID_BL  0x1011
++#define DV_PID_EL  0x1015
++
++/* DV dual-stream state (minimal - seek only) */
++typedef struct {
++    int           active;     /* 1 if DV dual-stream mode is active */
++    int64_t       seek_pts;   /* seek target PTS, -1 if not seeking */
++} DV_STATE;
++
++
++/* Find EL SPN for a given PTS from the EL EP map */
++static uint32_t _dv_find_el_spn(const NAV_CLIP *clip, int64_t target_pts)
++{
++    if (!clip || !clip->cl || clip->cl->cpi.num_stream_pid < 2)
++        return (uint32_t)-1;
++
++    const CLPI_EP_MAP_ENTRY *el_ep = NULL;
++    for (unsigned i = 0; i < clip->cl->cpi.num_stream_pid; i++) {
++        if (clip->cl->cpi.entry[i].pid == DV_PID_EL) {
++            el_ep = &clip->cl->cpi.entry[i];
++            break;
++        }
++    }
++    if (!el_ep || el_ep->num_ep_coarse == 0) return (uint32_t)-1;
++
++    int64_t best_pts = -1;
++    uint32_t best_spn = 0;
++    for (unsigned i = 0; i < el_ep->num_ep_coarse; i++) {
++        int64_t coarse_pts = (int64_t)((el_ep->coarse[i].pts_ep & ~0x01) << 18);
++        if (coarse_pts <= target_pts && coarse_pts > best_pts) {
++            best_pts = coarse_pts;
++            int ref = el_ep->coarse[i].ref_ep_fine_id;
++            best_spn = (el_ep->coarse[i].spn_ep & ~0x1FFFF) + el_ep->fine[ref].spn_ep;
++        }
++    }
++    return best_spn;
++}
++
++static void _dv_init(DV_STATE *dv)
++{
++    memset(dv, 0, sizeof(*dv));
++}
++
++static void _dv_reset(DV_STATE *dv)
++{
++    dv->seek_pts = -1;
++}
++
+ 
+ typedef enum {
+     title_undef = 0,
+@@ -178,6 +231,9 @@ struct bluray {
+     bd_argb_overlay_proc_f argb_overlay_proc;
+     BD_ARGB_BUFFER      *argb_buffer;
+     BD_MUTEX             argb_buffer_mutex;
++
++    /* DV DT-DL dual-stream */
++    DV_STATE             dv;
+ };
+ 
+ /* Stream Packet Number = byte offset / 192. Avoid 64-bit division. */
+@@ -2088,8 +2144,22 @@ static void _playmark_reached(BLURAY *bd)
+  */
+ 
+ static void _seek_internal(BLURAY *bd,
+-                           const NAV_CLIP *clip, uint32_t title_pkt, uint32_t clip_pkt)
+-{
++                            const NAV_CLIP *clip, uint32_t title_pkt, uint32_t clip_pkt)
++{
++    /* DV DT-DL: seek to min(BL_SPN, EL_SPN) to avoid missing EL packets */
++    if (bd->dv.active) {
++        uint32_t seek_time = 0;
++        if (clip->cl) {
++            clpi_access_point(clip->cl, clip_pkt, 0, 0, &seek_time);
++            uint32_t el_spn = _dv_find_el_spn(clip, (int64_t)seek_time);
++            if (el_spn != (uint32_t)-1 && el_spn < clip_pkt) {
++                clip_pkt = el_spn;
++            }
++        }
++        _dv_reset(&bd->dv);
++        bd->dv.seek_pts = (int64_t)seek_time;
++    }
++
+     if (_seek_stream(bd, &bd->st0, clip, clip_pkt) >= 0) {
+         uint32_t media_time;
+ 
+@@ -2177,6 +2247,10 @@ int64_t bd_seek_time(BLURAY *bd, uint64_t tick)
+         // Find the closest access unit to the requested position
+         clip = nav_time_search(bd->title, (uint32_t)tick, &clip_pkt, &out_pkt);
+ 
++        if (bd->dv.active) {
++            _dv_reset(&bd->dv);
++            bd->dv.seek_pts = (int64_t)tick;
++        }
+         _seek_internal(bd, clip, out_pkt, clip_pkt);
+ 
+     } else {
+@@ -2921,6 +2995,7 @@ static int _open_playlist(BLURAY *bd, unsigned playlist, unsigned angle)
+     bd->s_pos = 0;
+     bd->end_of_playlist = 0;
+     bd->st0.ig_pid = 0;
++    _dv_init(&bd->dv);
+ 
+     // Get the initial clip of the playlist
+     bd->st0.clip = nav_next_clip(bd->title, NULL);
+@@ -2934,6 +3009,16 @@ static int _open_playlist(BLURAY *bd, unsigned playlist, unsigned angle)
+         BD_DEBUG(DBG_BLURAY, "DV FEL EL sub-path enabled: %d\n", bd->dv_el_subpath);
+     }
+ 
++    /* Detect DV DT-DL dual-stream */
++    if (bd->title->sub_path_count > 0) {
++        for (unsigned i = 0; i < bd->title->sub_path_count; i++) {
++            if (bd->title->sub_path[i].type == 10) {
++                bd->dv.active = 1;
++                BD_DEBUG(DBG_BLURAY, "DV DT-DL dual-stream detected (sub-path type 10)\n");
++                break;
++            }
++        }
++    }
+ 
+     _update_playlist_psrs(bd);
+ 
+diff --git a/src/libbluray/decoders/m2ts_demux.c b/src/libbluray/decoders/m2ts_demux.c
+index 73bd4d9..8789507 100644
+--- a/src/libbluray/decoders/m2ts_demux.c
++++ b/src/libbluray/decoders/m2ts_demux.c
+@@ -128,7 +128,7 @@ static int _add_ts(PES_BUFFER *p, uint8_t *buf, unsigned len)
+  * Parsing
+  */
+ 
+-static int64_t _parse_timestamp(uint8_t *p)
++int64_t m2ts_parse_timestamp(uint8_t *p)
+ {
+     int64_t ts;
+     ts  = ((int64_t)(p[0] & 0x0E)) << 29;
+@@ -180,10 +180,10 @@ static int _parse_pes(PES_BUFFER *p, uint8_t *buf, unsigned len)
+         }
+ 
+         if (pts_exists) {
+-            p->pts = _parse_timestamp(buf + 9);
++            p->pts = m2ts_parse_timestamp(buf + 9);
+         }
+         if (dts_exists) {
+-            p->dts = _parse_timestamp(buf + 14);
++            p->dts = m2ts_parse_timestamp(buf + 14);
+         }
+     }
+ 
+diff --git a/src/libbluray/decoders/m2ts_demux.h b/src/libbluray/decoders/m2ts_demux.h
+index a344b59..aac34ea 100644
+--- a/src/libbluray/decoders/m2ts_demux.h
++++ b/src/libbluray/decoders/m2ts_demux.h
+@@ -44,5 +44,10 @@ BD_PRIVATE void m2ts_demux_reset(M2TS_DEMUX *);
+  */
+ BD_PRIVATE struct pes_buffer_s *m2ts_demux(M2TS_DEMUX *, uint8_t *block);
+ 
++/*
++ * Parse 33-bit PTS/DTS from MPEG-TS PES header (5 bytes at p)
++ */
++BD_PRIVATE int64_t m2ts_parse_timestamp(uint8_t *p);
++
+ 
+ #endif // _M2TS_DEMUX_H_
